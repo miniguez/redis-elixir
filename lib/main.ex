@@ -13,18 +13,33 @@ defmodule Server do
   @doc """
   Listen for incoming connections
   """
-  def listen() do
+  def listen(attempts_left \\ 3) do
     # You can use print statements as follows for debugging, they'll be visible when running tests.
     IO.puts("Logs from your program will appear here!")
 
     # Abre un socket TCP en el puerto 6379 (puerto estándar de Redis)
-    {:ok, socket} = :gen_tcp.listen(6379, [:binary, active: false, reuseaddr: true])
-    accept_connections(socket)
+    case :gen_tcp.listen(6379, [:binary, active: false, reuseaddr: true]) do
+      {:ok, socket} ->
+        IO.puts("Server listening on port 6379")
+        accept_connections(socket)
+      {:error, :eaddrinuse} when attempts_left > 1 ->
+        IO.puts("Port 6379 is in use, retrying in 1 second... (#{attempts_left - 1} attempts left)")
+        Process.sleep(1000)
+        listen(attempts_left - 1)
+      {:error, reason} ->
+        IO.puts("Failed to listen on port 6379 after multiple attempts: #{inspect(reason)}")
+        # Decide how to handle fatal error, e.g., exit or raise
+        # For an OTP application, this worker might crash and be restarted by supervisor
+        # depending on strategy. Here, we'll let it crash by re-raising or exiting.
+        {:error, reason} # Or System.halt(1) if this is a critical failure point for the app
+    end
   end
 
   defp accept_connections(socket) do
     # Acepta una nueva conexión de cliente
+    IO.puts("Waiting to accept connection...")
     {:ok, client} = :gen_tcp.accept(socket)
+    IO.puts("Connection accepted from client: #{inspect(client)}")
     # Inicia un nuevo proceso para manejar este cliente
     spawn(fn -> handle_client(client) end)
     # Vuelve a escuchar para más conexiones
@@ -40,18 +55,27 @@ defmodule Server do
         # Continúa escuchando más comandos de este cliente
         handle_client(client)
       {:error, :closed} ->
-        IO.puts("Client disconnected")
+        IO.puts("Client disconnected: #{inspect(client)}")
+      {:error, reason} ->
+        IO.puts("Error receiving data from client #{inspect(client)}: #{inspect(reason)}")
     end
   end
 
   defp handle_command(client, data) do
-    case parse_resp(data) do
+    parsed_command = parse_resp(data)
+    IO.puts("Parsed command: #{inspect(parsed_command)}")
+    case parsed_command do
       # Si el comando es PING, responde con PONG
       ["PING"] ->
         :gen_tcp.send(client, "+PONG\r\n")
+      # Si el comando es ECHO, responde con el argumento
+      ["ECHO", argument] ->
+        # Respond with the argument as a RESP Bulk String
+        :gen_tcp.send(client, "$#{String.length(argument)}\r\n#{argument}\r\n")
       # Para cualquier otro comando, responde con un error
       _ ->
-        IO.puts("Unknown command: #{inspect(data)}")
+        IO.puts("Unknown command raw data: #{inspect(data)}")
+        IO.puts("Unknown command parsed structure: #{inspect(parsed_command)}")
         :gen_tcp.send(client, "-ERR unknown command\r\n")
     end
   end
@@ -59,30 +83,79 @@ defmodule Server do
   defp parse_resp(data) do
     case data do
       # Si los datos comienzan con *, es un comando en formato RESP
-      <<?*, count::binary-size(1), "\r\n", rest::binary>> ->
-        parse_bulk_string(String.to_integer(count), rest, [])
-      # De lo contrario, trata los datos como una cadena simple
+      <<?*, count_char::binary-size(1), "\r\n", rest::binary>> ->
+        case String.to_integer(count_char) do
+          count_int when is_integer(count_int) and count_int >= 0 ->
+            parse_bulk_string_array(count_int, rest, [])
+          _ ->
+            IO.puts("Invalid array count: #{count_char}")
+            ["INVALID_RESP_COUNT"] # Error case
+        end
+      # De lo contrario, trata los datos como una cadena simple (inline command)
       _ ->
-        String.split(String.trim(data))
+        # This path is typically for inline commands like "PING" sent by telnet
+        # For RESP arrays, it might indicate an issue or a non-array command format
+        trimmed_data = String.trim(data)
+        if String.length(trimmed_data) > 0 do
+          String.split(trimmed_data, " ") # Split by space for simple commands
+        else
+          [""] # Handle empty command case
+        end
     end
   end
 
-  # Función recursiva para parsear strings en formato RESP
-  defp parse_bulk_string(0, _, acc), do: Enum.reverse(acc)
-  defp parse_bulk_string(count, <<?$, len::binary-size(1), "\r\n", rest::binary>>, acc) do
-    # Extrae la cadena de la longitud especificada
-    {string, rest} = String.split_at(rest, String.to_integer(len))
-    # Continúa parseando el resto de los datos
-    parse_bulk_string(count - 1, String.slice(rest, 2..-1//-1), [string | acc])
+  # Parses a RESP array of bulk strings
+  defp parse_bulk_string_array(0, _rest, acc), do: Enum.reverse(acc)
+  defp parse_bulk_string_array(_count, <<>>, acc) do
+    IO.puts("Reached end of data unexpectedly while parsing bulk string array")
+    Enum.reverse(acc) # Or handle as an error
   end
+  defp parse_bulk_string_array(count, <<?$, rest_after_dollar::binary>>, acc) do
+    # Expecting <length>\r\n<data>\r\n
+    case String.split(rest_after_dollar, "\r\n", parts: 2) do
+      [length_str, rest_after_length_crlf] ->
+        case String.to_integer(length_str) do
+          len when is_integer(len) and len >= 0 ->
+            if byte_size(rest_after_length_crlf) >= len + 2 do # +2 for the final \r\n
+              <<string_data::binary-size(len), "\r\n", rest_after_string_crlf::binary>> = rest_after_length_crlf
+              parse_bulk_string_array(count - 1, rest_after_string_crlf, [string_data | acc])
+            else
+              IO.puts("Insufficient data for string of length #{len}")
+              # This is an error condition, data is shorter than expected
+              Enum.reverse(["ERROR_INSUFFICIENT_DATA" | acc])
+            end
+          _ ->
+            IO.puts("Invalid bulk string length: #{length_str}")
+            Enum.reverse(["ERROR_INVALID_LENGTH" | acc]) # Error case
+        end
+      _ ->
+        IO.puts("Malformed bulk string: missing CRLF after length")
+        Enum.reverse(["ERROR_MALFORMED_BULK_STRING" | acc]) # Error case
+    end
+  end
+  defp parse_bulk_string_array(_count, other_data, acc) do # _count was count
+    IO.puts("Unexpected data format in parse_bulk_string_array. Expected '$', got: #{inspect other_data}")
+    # This signifies a parsing error or unexpected format.
+    # Depending on strictness, could return an error token or try to salvage.
+    # For now, returning what we have plus an error marker.
+    Enum.reverse(["ERROR_UNEXPECTED_FORMAT_IN_ARRAY" | acc])
+  end
+
 end
 
+
+# This CLI module might be intended to start the Server application
+# For now, we assume the Server module is started as part of the :codecrafters_redis OTP app
+# as defined in mix.exs (or by a top-level supervisor)
 defmodule CLI do
   def main(_args) do
     # Inicia la aplicación del servidor
     {:ok, _pid} = Application.ensure_all_started(:codecrafters_redis)
 
     # Mantiene el proceso principal en ejecución
+    # This is only needed if CLI.main is the entry point of the entire VM
+    # and not if this is just a utility to ensure the app is running.
+    IO.puts("CLI.main: Entering sleep loop to keep process alive.")
     Process.sleep(:infinity)
   end
 end
