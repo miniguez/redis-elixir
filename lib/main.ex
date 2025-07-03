@@ -6,11 +6,30 @@ defmodule Server.Store do
   end
 
   def get(key) do
-    Agent.get(__MODULE__, &Map.get(&1, key))
+    Agent.get_and_update(__MODULE__, fn state ->
+      current_time = System.monotonic_time(:millisecond)
+      case Map.get(state, key) do
+        nil ->
+          {nil, state} # Key not found
+        {value, expiration_time} ->
+          if not is_nil(expiration_time) and current_time >= expiration_time do
+            {nil, Map.delete(state, key)} # Key expired
+          else
+            {value, state}
+          end
+      end
+    end)
   end
 
-  def set(key, value) do
-    Agent.update(__MODULE__, &Map.put(&1, key, value))
+  def set(key, value, expiry_ms \\ nil) do
+    expiration_time =
+      if expiry_ms do
+        System.monotonic_time(:millisecond) + expiry_ms
+      else
+        nil
+      end
+
+    Agent.update(__MODULE__, &Map.put(&1, key, {value, expiration_time}))
   end
 end
 
@@ -92,8 +111,22 @@ defmodule Server do
         # Respond with the argument as a RESP Bulk String
         :gen_tcp.send(client, "$#{String.length(argument)}\r\n#{argument}\r\n")
       # Si el comando es SET, almacena el valor y responde con OK
+      # Handles SET key value PX expiry_ms (case-insensitive for PX)
+      ["SET", key, value, option, expiry_ms_str] ->
+        cond do
+          String.downcase(option) == "px" ->
+            case Integer.parse(expiry_ms_str) do
+              {expiry_ms, ""} when expiry_ms > 0 ->
+                Server.Store.set(key, value, expiry_ms)
+                :gen_tcp.send(client, "+OK\r\n")
+              _ ->
+                :gen_tcp.send(client, "-ERR value is not an integer or out of range\r\n")
+            end
+          true -> # Default for other 5-argument SET commands that are not PX
+            :gen_tcp.send(client, "-ERR syntax error\r\n")
+        end
       ["SET", key, value] ->
-        Server.Store.set(key, value)
+        Server.Store.set(key, value) # Defaults to no expiry
         :gen_tcp.send(client, "+OK\r\n")
       # Si el comando es GET, recupera el valor y responde
       ["GET", key] ->
