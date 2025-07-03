@@ -1,3 +1,19 @@
+defmodule Server.Store do
+  use Agent
+
+  def start_link(_opts) do
+    Agent.start_link(fn -> %{} end, name: __MODULE__)
+  end
+
+  def get(key) do
+    Agent.get(__MODULE__, &Map.get(&1, key))
+  end
+
+  def set(key, value) do
+    Agent.update(__MODULE__, &Map.put(&1, key, value))
+  end
+end
+
 defmodule Server do
   @moduledoc """
   Your implementation of a Redis server
@@ -6,8 +22,11 @@ defmodule Server do
   use Application
 
   def start(_type, _args) do
-    # Inicia el servidor como una aplicación supervisada
-    Supervisor.start_link([{Task, fn -> Server.listen() end}], strategy: :one_for_one)
+    children = [
+      {Task, fn -> Server.listen() end},
+      Server.Store # Add the store to the supervision tree
+    ]
+    Supervisor.start_link(children, strategy: :one_for_one)
   end
 
   @doc """
@@ -72,6 +91,18 @@ defmodule Server do
       ["ECHO", argument] ->
         # Respond with the argument as a RESP Bulk String
         :gen_tcp.send(client, "$#{String.length(argument)}\r\n#{argument}\r\n")
+      # Si el comando es SET, almacena el valor y responde con OK
+      ["SET", key, value] ->
+        Server.Store.set(key, value)
+        :gen_tcp.send(client, "+OK\r\n")
+      # Si el comando es GET, recupera el valor y responde
+      ["GET", key] ->
+        case Server.Store.get(key) do
+          nil ->
+            :gen_tcp.send(client, "$-1\r\n") # Key not found
+          value ->
+            :gen_tcp.send(client, "$#{String.length(value)}\r\n#{value}\r\n")
+        end
       # Para cualquier otro comando, responde con un error
       _ ->
         IO.puts("Unknown command raw data: #{inspect(data)}")
