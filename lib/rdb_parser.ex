@@ -157,7 +157,7 @@ defmodule Server.RDBParser do
   end
 
 
-  defp parse_header(<<@magic_string::binary-size(5), version_binary::binary-size(@rdb_version_length), rest::binary>>) do
+  defp parse_header(<<@magic_string::binary, version_binary::binary-size(@rdb_version_length), rest::binary>>) do
     # The version is stored as ASCII characters, e.g., "0009"
     case Integer.parse(version_binary) do
       {version, ""} -> {:ok, version, rest}
