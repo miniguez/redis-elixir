@@ -1,115 +1,40 @@
 defmodule Server.Store do
   use Agent
 
-  @name __MODULE__
-
   def start_link(_opts) do
-    # Initial state: %{key => {value, expiration_time_monotonic_ms}}
-    # For RDB loaded keys, value might be a special marker or map like %{rdb_loaded: true, original_expiry_unix_ms: ...}
-    Agent.start_link(fn -> %{} end, name: @name)
+    Agent.start_link(fn -> %{} end, name: __MODULE__)
   end
 
   def get(key) do
-    Agent.get_and_update(@name, fn state ->
-      current_time_monotonic_ms = System.monotonic_time(:millisecond)
+    Agent.get_and_update(__MODULE__, fn state ->
+      current_time = System.monotonic_time(:millisecond)
       case Map.get(state, key) do
         nil ->
           {nil, state} # Key not found
-        {value_data, expiration_time_monotonic_ms} ->
-          if not is_nil(expiration_time_monotonic_ms) and current_time_monotonic_ms >= expiration_time_monotonic_ms do
+        {value, expiration_time} ->
+          if not is_nil(expiration_time) and current_time >= expiration_time do
             {nil, Map.delete(state, key)} # Key expired
           else
-            # If value_data is a map for RDB, extract actual value if needed, or return as is.
-            # For now, the `KEYS` command only needs existence, not the value itself.
-            # The `GET` command would need to handle this if it were to retrieve RDB values.
-            actual_value = if is_map(value_data) and Map.has_key?(value_data, :rdb_loaded), do: value_data.original_value, else: value_data
-            {actual_value, state}
+            {value, state}
           end
       end
     end)
   end
 
-  def set(key, value, expiry_px_ms \\ nil) do
-    expiration_time_monotonic_ms =
-      if expiry_px_ms do
-        System.monotonic_time(:millisecond) + expiry_px_ms
+  def set(key, value, expiry_ms \\ nil) do
+    expiration_time =
+      if expiry_ms do
+        System.monotonic_time(:millisecond) + expiry_ms
       else
         nil
       end
-    # Standard SET command stores the direct value
-    Agent.update(@name, &Map.put(&1, key, {value, expiration_time_monotonic_ms}))
+
+    Agent.update(__MODULE__, &Map.put(&1, key, {value, expiration_time}))
   end
 
-  def load_from_rdb(rdb_file_path) do
-    case File.read(rdb_file_path) do
-      {:ok, rdb_binary_content} ->
-        case Server.RDBParser.parse(rdb_binary_content) do
-          {:ok, parsed_keys_info, _aux_data} ->
-            Agent.update(@name, fn current_state ->
-              Enum.reduce(parsed_keys_info, current_state, fn {key_str, expiry_unix_ms, _db_num}, acc_state ->
-                # For keys from RDB, we store a map indicating its origin and original expiry.
-                # The actual value from RDB is not stored yet, placeholder `true` or the key itself.
-                # If GET is to work with these, this structure needs to be handled in GET.
-                # For now, KEYS just needs the key to exist.
-
-                # Convert UNIX ms expiry to monotonic TTL if needed for consistency,
-                # or store UNIX ms and handle in get.
-                # For simplicity, let's store original UNIX ms and check against wall clock for RDB keys.
-                # However, the `get` function currently uses monotonic time.
-                # Let's adjust: if expiry_unix_ms is present, calculate remaining TTL from now.
-
-                current_wall_time_ms = DateTime.to_unix(DateTime.utc_now(), :millisecond)
-                value_to_store = %{rdb_loaded: true, original_expiry_unix_ms: expiry_unix_ms, original_value: "[RDB_VALUE_PLACEHOLDER]"}
-
-                cond do
-                  is_nil(expiry_unix_ms) -> # No expiry
-                    Map.put(acc_state, key_str, {value_to_store, nil})
-                  expiry_unix_ms > current_wall_time_ms -> # Not expired yet
-                    # Calculate remaining TTL from now for monotonic clock
-                    remaining_ttl_ms = expiry_unix_ms - current_wall_time_ms
-                    expiration_time_monotonic_ms = System.monotonic_time(:millisecond) + remaining_ttl_ms
-                    Map.put(acc_state, key_str, {value_to_store, expiration_time_monotonic_ms})
-                  true -> # Already expired based on wall clock
-                    IO.puts("RDB key '#{key_str}' already expired based on wall clock. Not loading.")
-                    acc_state # Don't add to store
-                end
-              end)
-            end)
-            IO.puts("Successfully loaded #{length(parsed_keys_info)} keys from RDB: #{rdb_file_path}")
-            :ok
-          {:error, reason} ->
-            IO.puts("Failed to parse RDB file #{rdb_file_path}: #{reason}")
-            {:error, "RDB parsing failed: #{reason}"}
-        end
-      {:error, reason} ->
-        IO.puts("Failed to read RDB file #{rdb_file_path}: #{reason}")
-        # If the file doesn't exist, it's not an error for Redis, it just starts empty.
-        # Other read errors might be more critical.
-        if reason == :enoent do
-          IO.puts("RDB file not found at #{rdb_file_path}. Starting with an empty state.")
-          :ok # Not an error if file doesn't exist
-        else
-          {:error, "RDB file read error: #{reason}"}
-        end
-    end
+  def keys() do
+    Agent.get(__MODULE__, &Map.keys(&1))
   end
-
-  def get_all_keys() do
-    Agent.get_and_update(@name, fn state ->
-      current_time_monotonic_ms = System.monotonic_time(:millisecond)
-      valid_keys =
-        state
-        |> Enum.filter(fn {_key, {_value_data, expiration_time_monotonic_ms}} ->
-          is_nil(expiration_time_monotonic_ms) or current_time_monotonic_ms < expiration_time_monotonic_ms
-        end)
-        |> Enum.map(fn {key, _value} -> key end) # Extract just the key string
-
-      # The first element of the tuple is the return value of Agent.get_and_update
-      # The second is the new state (which is unchanged in this case as we are only reading)
-      {valid_keys, state}
-    end)
-  end
-
 end
 
 defmodule Server.Config do
@@ -166,31 +91,32 @@ defmodule Server do
     #IO.puts("Server.start converted CLI options to map: #{inspect(cli_options_map)}")
 
     children = [
-      {Server.Config, cli_options_map}, # Start Config first
-      Server.Store,                     # Then Store
-      {Task, fn -> Server.load_rdb_and_start_listening() end} # Then load RDB and listen
+      {Server.Config, cli_options_map},
+      {Task, fn -> Server.listen() end},
+      Server.Store
     ]
-    Supervisor.start_link(children, strategy: :one_for_one)
-  end
+    {:ok, sup_pid} = Supervisor.start_link(children, strategy: :one_for_one)
 
-  def load_rdb_and_start_listening() do
-    # Load RDB data after Server.Config and Server.Store are up
+    # Load RDB data after config and store are up
     dir = Server.Config.get("dir")
     dbfilename = Server.Config.get("dbfilename")
 
+    IO.puts("Server.start: dir from config: #{inspect(dir)}, dbfilename from config: #{inspect(dbfilename)}")
+
     if dir && dbfilename do
       rdb_path = Path.join(dir, dbfilename)
-      IO.puts("Attempting to load RDB file from: #{rdb_path}")
-      case Server.Store.load_from_rdb(rdb_path) do
-        :ok -> IO.puts("RDB loading process completed.")
-        {:error, reason} -> IO.puts("Error during RDB loading: #{inspect(reason)}. Server will start with empty/current state.")
-      end
+      IO.puts("Server.start: Attempting to load RDB from #{rdb_path}")
+      # Call the RDB loading function (to be implemented)
+      # Server.RDB.load_file(rdb_path)
+      # For now, let's create a placeholder for the module and function call
+      # so the compiler doesn't complain immediately.
+      # Call the RDB loading function
+      Server.RDB.load_file(rdb_path)
     else
-      IO.puts("RDB directory or filename not configured. Skipping RDB load.")
+      IO.puts("Server.start: RDB directory or filename not configured. Skipping RDB load.")
     end
 
-    # Proceed to listen for connections
-    Server.listen()
+    {:ok, sup_pid}
   end
 
   @doc """
@@ -303,39 +229,14 @@ defmodule Server do
             # If the value is not a binary, we should handle it as an error.
             :gen_tcp.send(client, "-ERR internal error retrieving config for '#{param_name_input}'\r\n")
         end
+      ["KEYS", "*"] ->
+        keys_list = Server.Store.keys()
+        resp_parts = Enum.map(keys_list, fn key ->
+          "$#{String.length(key)}\r\n#{key}\r\n"
+        end)
+        response = "*#{length(keys_list)}\r\n" <> Enum.join(resp_parts, "")
+        :gen_tcp.send(client, response)
       # Handles CONFIG SET parameter value
-      ["KEYS", pattern_str] ->
-        all_keys = Server.Store.get_all_keys() # This function needs to be added to Server.Store
-        # Convert glob pattern to regex: '*' -> '.*', '?' -> '.', etc.
-        # For this stage, only '*' is required by the problem description.
-        # Basic glob to regex: escape special Redis chars, then convert *
-        regex_pattern_str =
-          pattern_str
-          |> String.replace("*", ".*") # Replace glob * with regex .*
-          # Add other glob conversions here if needed, e.g., ? -> .
-          # Ensure the pattern matches the whole string:
-          |> then(&"^#{&1}$")
-
-        case Regex.compile(regex_pattern_str) do
-          {:ok, regex} ->
-            matching_keys =
-              Enum.filter(all_keys, fn key ->
-                Regex.match?(regex, key)
-              end)
-
-            # Format as RESP array
-            response_parts = ["*#{length(matching_keys)}\r\n"]
-            response_parts =
-              Enum.reduce(matching_keys, response_parts, fn key, acc ->
-                acc ++ ["$#{String.length(key)}\r\n#{key}\r\n"]
-              end)
-            :gen_tcp.send(client, IO.iodata_to_binary(response_parts))
-
-          {:error, reason} ->
-            IO.puts("Invalid regex pattern from glob '#{pattern_str}': #{reason}")
-            :gen_tcp.send(client, "-ERR invalid pattern\r\n")
-        end
-
       _ ->
         IO.puts("Unknown command raw data: #{inspect(data)}")
         IO.puts("Unknown command parsed structure: #{inspect(parsed_command)}")
