@@ -119,15 +119,6 @@ defmodule Server.RDBParser do
     is_expired =
       cond do
         is_nil(expiry_ms) -> false
-        # RDB expiry times are absolute Unix timestamps in ms.
-        # For simplicity in this stage, if we are loading into an in-memory store that uses relative TTLs,
-        # we'd convert. But for just checking if it's *already* expired *now*, direct comparison is fine.
-        # The problem asks to load keys, implying we should respect expiry.
-        # Let's assume expiry_ms is an absolute Unix timestamp.
-        # For this exercise, we'll compare with current wall clock time.
-        # Note: Redis typically converts these to relative TTLs on load or uses absolute server time.
-        # This simplistic check might differ from Redis's exact behavior if server times are skewed.
-        # For the coding challenge, this should be sufficient to filter out past-expiry keys.
         expiry_ms < DateTime.to_unix(DateTime.utc_now(), :millisecond) -> true
         true -> false
       end
@@ -230,10 +221,6 @@ defmodule Server.RDBParser do
         {:ok, Integer.to_string(int_val), rest_after_int}
 
       {:ok, _length, _rest, {:compressed_string}} ->
-        # For now, we don't support LZF compressed strings.
-        # This is a simplification for the current task.
-        # In a full implementation, LZF decompression would be needed here.
-        # It would involve reading compressed length, uncompressed length, then data.
         Logger.warning("LZF compressed string encountered, not supported for keys yet.")
         {:error, "LZF compressed strings are not supported yet"}
 
